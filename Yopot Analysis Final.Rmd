@@ -1,0 +1,390 @@
+---
+title: "NLP on Reviews"
+author: "Scott Lawrence"
+date: "2/8/2020"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+<h1>Hunting for Talk Triggers</h1><br>
+<p>By Scott Lawrence</p>
+
+
+<p>I work at <a href="https://www.rachio.com/">Rachio</a>, a smart sprinkler start up based here in Denver, CO. Like a lot of start ups, we have a lot of focus on rapid growth without a massie investment in advertising to get us there. That led me to this concept of "Talk Triggers". In essence, these are organic marketing campaigns intended to drive strong word of mouth by having an intentionally designed talking point that invites customers to share their experience with friends and others. After reading this book, I wondered if I could identify potential Talk Triggers for a company based on topics in their reviews.</p>
+
+<p>To get started, I will load (almost) all of the packages I will use in this write up first.</p>
+
+```{r setup, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyr) #Data manipulation and cleansing
+library(dplyr) #data manipulation
+library(ggplot2) #visualizations
+library(gridExtra) #viewing multiple plots together
+library(tidytext) #text mining
+library(wordcloud2) #creative visualizations
+library(caret)
+library(betareg)
+
+```
+
+<h2>Amazon Revirw Scraping </h2>
+<p>For Rachio, I wanted to identify a potential Talk Trigger using their Amazon reivews. Initially I started out with the code below.<b>Be warned: if you are not very careful when you try to scrape Amazon, you can get your IP banned for violating terms of service. I found several tutorials that made this look easy enough, but none of them expressed the actual challenges with scraping safely and anonymously. I will likely create a follow up post, but for now I'm sharing my code, but proceed with caution.</p>
+```{r Review Amazon, eval = FALSE}
+scrape_amazon <- function(ASIN, page_num){
+  
+  url_reviews <- paste0("https://www.amazon.com/product-reviews/",ASIN,"/?pageNumber=",page_num)
+  
+  doc <- read_html(url_reviews) # Assign results to `doc`
+  
+  # Review Title
+  doc %>% 
+    html_nodes("[class='a-size-base a-link-normal review-title a-color-base review-title-content a-text-bold']") %>%
+    html_text() -> review_title
+  
+  # Review Text
+  doc %>% 
+    html_nodes("[class='a-size-base review-text review-text-content']") %>%
+    html_text() -> review_text
+  
+  # Number of stars in review
+  doc %>%
+    html_nodes("[data-hook='review-star-rating']") %>%
+    html_text() -> review_star
+  
+  # Return a tibble
+  tibble(review_title,
+         review_text,
+         review_star,
+         page = page_num) %>% return()
+}
+
+ASIN <- 'B07CZ864Y9'
+
+scrape_amazon(ASIN,2) %>% head()
+```
+
+<h2>Importing Allowable Review Data</h2>
+<p>Instead, I was able to grab a dataset from my company's review provider, www.yotpot.com. Similar to Amazon reviews, it contained review title, scores, and free text content. It did howver contain a few other items and rows that were not useful. I am reading it in as a CSV and evaluating what product are included and sorting by count. </p>
+<p>We actually created a marketing plan last summer, asking customers to write in and tell us theit favorite Rachio story to celebrate turning 5. This data would be amazing for this project, but is too proprietary to share in this kind of forum.</p>
+
+```{r Read in data}
+yotpo <- read.csv("C:/Users/scott/Downloads/yotpo.csv.csv", stringsAsFactors = FALSE)
+
+product_view <- yotpo %>% group_by(product_title, product_id) %>% tally() %>% arrange(desc(n))
+
+product_view
+```
+<p>There are products that are not part of the core product. I'm going to filter down to just the reviews on the Rachio 3 or Generation 2. </p>
+<p>Next, I need to prepare our main data set by dropping useless columns, filtering out bad rows, and creating a "Class" row which we wil use in later steps.</p>
+```{r Clean up columns and remove bad data}
+final_cols <- c("review_title","review_content","review_score","cf_Default.form__Ease.of.Setup","cf_Default.form__Ease.of.Use")
+
+reviews <- yotpo %>% 
+  filter(product_id %in% c("538387841090","1389718661","543791939650","yotpo_site_reviews")) %>% 
+  filter(published == "true" & user_type == "verified_buyer") %>% 
+  filter(!is.na(review_score)) %>% 
+  select(final_cols)
+
+reviews$class <- as.factor(gsub(TRUE,"Positive",reviews$review_score == 5))
+reviews$class <- as.factor(gsub("FALSE","Negative",reviews$class))
+
+```
+
+
+<h2>Cleaning Data</h2>
+<p>For this step I wanted to start removing strange characters, contractors, and convert a few odd phrases I found. There are many tools that will do this automatically for you,but I wanted to manually control the words. To do this, I created a simple function using gsub(), applied it to titles and review content. I also created a random sample of 10 reviews and refreshed until I found most of the major issues I wanted to resolve.<p>
+
+```{r Fix contractions}
+# function to expand contractions in an English-language source
+fix.contractions <- function(doc) {
+  # "won't" is a special case as it does not expand to "wo not"
+  doc <- gsub("tâ\200\231", "'", doc)
+  doc <- gsub("â€™", "'", doc)
+  doc <- gsub("won't", "will not", doc)
+  doc <- gsub("can't", "can not", doc)
+  doc <- gsub("n't", " not", doc)
+  doc <- gsub("'ll", " will", doc)
+  doc <- gsub("'re", " are", doc)
+  doc <- gsub("'ve", " have", doc)
+  doc <- gsub("'m", " am", doc)
+  doc <- gsub("\\'d", " would", doc)
+  doc <- gsub("scheduled", "schedule", doc)
+  doc <- gsub("water.\\s", "water", doc)
+  doc <- gsub("\\'s", "", doc)
+  return(doc)
+}
+
+
+reviews$review_title <- sapply(reviews$review_title,fix.contractions)
+sample(reviews$review_content,10)
+
+reviews$review_content <- sapply(reviews$review_content, tolower)
+custom_stop_words <- data.frame("word" = c('rachio 3','gen2','rachio','rachio ','generation 2'))
+
+```
+<h2>Visualizing Data</h2>
+<h3>Histograms</h3>
+<p>The first step in getting start is just try to visualize the data. The easiest place to start is with the only numeric value, the star ratings. Since most reviews are 5-stars, so I created a binary classifier of "Positive" and "Negative" based on a perfect score or not.</p>
+```{r visualize data}
+
+paste("Customer Ratings = ",round(mean(reviews$review_score),2))
+
+ggplot(data = reviews, aes(x=as.numeric(review_score), )) +
+  geom_histogram(breaks=seq(.25,5,by=.25),
+                 color = "darkblue",
+                 fill = "skyblue",
+                 alpha = .5) +
+  labs(x="Star Rating",y="Number of reviews") +
+  ggtitle("Average Rachio Reviews")
+
+
+
+ggplot(data = reviews, aes(x=class, y = 1 )) +
+  geom_bar(      stat = "identity", 
+                 fill = "skyblue",
+                 alpha = .5) +
+  labs(x="Review class",y="Number of reviews") +
+  ggtitle("Average Rachio Reviews")
+
+```
+
+<h3>Wordclouds</h3>
+<p>I think Wordclouds get a bad rap, but they are pretty useful when you are trying to get a quick visualization of what is in your major set. I feel like my brain is able to take in a lot more information from a wordcloud than a wordcount list or bar chart.</p> 
+
+```{r Create Data for Wordclouds, message=FALSE, warning=FALSE}
+
+
+words_filtered <- reviews %>%
+  unnest_tokens(word, review_content) %>%
+  anti_join(stop_words) %>%
+  anti_join(custom_stop_words) %>%
+  distinct() %>%
+  filter(nchar(word) > 3)
+
+
+all_words <- words_filtered %>%
+  group_by(word,review_score) %>% 
+  tally() %>% 
+  arrange(desc(n), word)
+
+word_counts_negative <- words_filtered %>% filter(review_score <= 3) %>% count(word, sort = TRUE)
+word_counts <- words_filtered %>% filter(review_score >= 4) %>% count(word, sort = TRUE)
+
+positive_wc <- wordcloud2(word_counts[1:200,], size = .5, color = "skyblue")
+negative_wc <- wordcloud2(word_counts_negative[1:200,], size = .5, color = "maroon")
+
+positive_wc
+negative_wc
+
+```
+
+<h3>N-Grams and Tokenization</h3>
+<p>At this point, I am simply trying to identify terms that may prove meaningful to consumers. Using n-grams is a great way to evaluate a phrase instead of the combination of words that make up the whole. I am using a listed table and word cloud here again to identify patterns. The most meaningful lists I found in this application were 3-gram and 5-grams. 
+
+```{r nGram, warning = FALSE}
+#Chane this variable to cha}nge the size of the nGram
+n_gram_size <- 5
+
+#This will process 
+ngrams_filtered <- reviews %>%
+  unnest_tokens(word, review_content, token = "ngrams", n = n_gram_size) %>%
+  group_by(word) %>%
+  filter(!is.na(word)) %>%
+  anti_join(stop_words) %>%
+  anti_join(custom_stop_words) %>%
+  filter(nchar(word) > 3) %>%
+  tally() %>%
+  arrange(desc(n))
+
+ngrams_filtered
+
+wordcloud2(ngrams_filtered[1:200,], size = .7, color = "skyblue")
+```
+
+
+
+<h3>TF-IDF Analysis</h3>
+<p>Just because a word pops up frequently doesn't actually mean it is the most important word, espescially within specific subjects. Espescially in certain domains, certain words or phrases can be very commonly used, but don't actually carry much unique weight. Imagine if we were doing reviews for exterminators, the word mouse would probably show up a lot, but wouldn't be that important. If you were analyzing reviews of a bakery, you wouldn't likely see the word "mouse" a lot, but you can bet it is much more important to the context.</p>
+<p>One way to analyze this is to use TF-IDF or "term frequency over inverse document frequency". This is a method that estimates the frequency of each term within the review compared to the total number of words. It then looks at how often that word appears in corpus of documents (all reviews) and divides it by the inverse. The effect is that words that are common in a review, but common in all reviews get a reduced score. Words that are used frequently in a few reviews are giving a higher score. This is typically used for document searches, but could be useful in the hunt for talk trigger words.</p>
+```{r Term Frequency Interdocument Frequency, message = false, warning = FALSE}
+tf_idf_table <- reviews %>%
+  unnest_tokens(word, review_content) %>%
+  distinct() %>%
+  anti_join(stop_words) %>%
+  anti_join(custom_stop_words) %>%
+  filter(nchar(word) > 3) %>%
+  count(review_score, word, sort = TRUE) %>%
+  ungroup() %>%
+  bind_tf_idf(word, review_score, n)
+  
+head(tf_idf_table)
+
+tf_idf2 <- tf_idf_table %>% 
+  arrange(desc(tf_idf)) %>%
+  mutate(word = factor(word, levels = rev(unique(word)))) %>%
+  group_by(review_score) %>% 
+  slice(seq_len(10)) %>%
+  ungroup() %>%
+  arrange(desc(review_score),tf_idf) %>%
+  mutate(row = row_number())
+
+tf_idf2
+
+tf_idf2 %>%
+  ggplot(aes(x = row, tf_idf, 
+             fill = review_score)) +
+    geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "TF-IDF")  +
+    ggtitle("Important Words using TF-IDF by Review level")  +
+
+    facet_wrap(~review_score, ncol = 3, scales = "free")  +
+
+    scale_x_continuous(  # This handles replacement of row 
+      breaks = tf_idf2$row, # notice need to reuse data frame
+      labels = tf_idf2$word) +
+    coord_flip()
+```
+<h2>Machine Learning</h2>
+<h3>Preparing Data</h3>
+<p>Now that I have been able to scout the most common words and phrases as well as the most unique words, I want to use that information to create a training set for Machine Learning models. If I were doing a predictive model, I'd probably leave all the words in the model and let a Baysian model solve it. Since I am using ML for interpretation, I want to make sure the words and phrases that are included would have some meaningful application to the business. </p>
+
+<p>I am using a grepl() function to look up words and phrases. I even created a few interactions use NOT, AND, OR logic as well. The final result is a sparsely populated table that we can start to use to predict positive or negive scores. </p>
+```{r Create data sets for ML}
+review_onehot <- reviews %>% select(class)
+review_onehot$isPositive <- as.numeric(grepl("Positive",reviews$class))
+review_onehot$easy_to_use <- as.numeric(grepl("easy to use",reviews$review_content))
+review_onehot$homekit <- as.numeric(grepl("homekit|home kit",reviews$review_content))
+review_onehot$return <- as.numeric(grepl("return|shipping",reviews$review_content))
+review_onehot$finally <- as.numeric(grepl("finally",reviews$review_content))
+review_onehot$emails.support <- as.numeric(grepl("email",reviews$review_content) & grepl("support",reviews$review_content))
+review_onehot$emails.notsupport <- as.numeric(grepl("email",reviews$review_content) & !grepl("support",reviews$review_content))
+review_onehot$easy_setup <- as.numeric(grepl("easy to set up|easy to setup",reviews$review_content))
+review_onehot$zones <- as.numeric(grepl("zones",reviews$review_content))
+review_onehot$support.notemail <- as.numeric(grepl("support",reviews$review_content) & !grepl("email",reviews$review_content))
+review_onehot$competitor <- as.numeric(grepl("rainbird|bhyve|hunter|orbit",reviews$review_content))
+review_onehot$connect <- as.numeric(grepl("connect",reviews$review_content))
+review_onehot$the_app <- as.numeric(grepl("the app",reviews$review_content))
+review_onehot$control <- as.numeric(grepl("control|controls|controlling",reviews$review_content))
+review_onehot$wifi <- as.numeric(grepl("wifi",reviews$review_content))
+review_onehot$flow_meter <- as.numeric(grepl("flow meter",reviews$review_content))
+review_onehot$phone <- as.numeric(grepl("phone",reviews$review_content))
+review_onehot$money <- as.numeric(grepl("money",reviews$review_content))
+review_onehot$the_app <- as.numeric(grepl("the app",reviews$review_content))
+review_onehot$weather <- as.numeric(grepl("weather|rain|snow",reviews$review_content))
+review_onehot$plants <- as.numeric(grepl("lawn|plants|bushes",reviews$review_content))
+review_onehot$dissapointed <- as.numeric(grepl("dissapointed",reviews$review_content))
+review_onehot$service <- as.numeric(grepl("service",reviews$review_content))
+review_onehot$frustrated <- as.numeric(grepl("frustrated",reviews$review_content))
+review_onehot$love <- as.numeric(grepl("love",reviews$review_content))
+
+```
+<h3>Test / Training Sets</h3>
+<p>Next I am going to create test and training sets so I can protect my models against over fitting.</p>
+
+```{r Split into test and training}
+train_split <-   sample(c(TRUE,FALSE), nrow(review_onehot), prob = c(.25,.75), replace = TRUE)
+
+review_onehot_train <- review_onehot
+review_onehot_train$split <- train_split
+
+review_onehot_train <- review_onehot_train %>% 
+  filter(split == FALSE) %>%
+    select(-split)
+
+
+
+review_onehot_test <- review_onehot
+review_onehot_test$split <- train_split
+
+review_onehot_test <- review_onehot_test %>% 
+  filter(split == TRUE) %>%
+  select(-split)
+
+rbind("test" = c(summary(review_onehot_test$class),"Total"=nrow(review_onehot_test)), "train" = c(summary(review_onehot_train$class),"Total" = nrow(review_onehot_train)) )
+
+default_cutoff <- mean(review_onehot_test$isPositive)
+
+```
+
+<h3>Rnadom forest model</h3>
+<p>First, I want to use a random forest model so I can extract a variable importance table. I wasn't able to get the model to be very accurate, even with tuning and experimenting with other variations of random forest like boosted and bagged models. Still, the variable importance curve may prove valuable, though a far cry from the statistical signicace threshold you would need to see in finance or classroom settings.</p> 
+```{r Random Forest Variable Importance}
+control <- trainControl(method = 'repeatedcv',
+                     number = 10,
+                     repeats = 3)
+mtry <- sqrt(ncol(review_onehot_train))
+tunegrid <- expand.grid(.mtry=mtry)
+rf_model <- train(class ~.,
+                  data = subset(review_onehot_train, select = -isPositive),
+                  method ='rf',
+                  metric ='Accuracy',
+                  tunegrid = tunegrid,
+                  trControl = control
+)
+
+
+print(rf_model)
+plot(rf_model)
+
+rf_predict <- predict(rf_model, review_onehot_test)
+
+head(rf_predict)
+summary(rf_predict)
+
+confusionMatrix(as.factor(rf_predict),as.factor(review_onehot_test$class))
+
+rf_varImp <- varImp(rf_model, scale = TRUE)
+rf_varImp
+ggplot(data = rf_varImp, aes(x=Overall)) +
+  geom_bar(stat = "identity", fill = "skyblue", alpha = .7) 
+
+```
+<h3>GLM Model</h3>
+<p>The variable importance data from the random forst is useful, but without direction or magnitude, it is hard to make really meaningful insights. Plys, the model is simply not that accurate. I will create another model again here and evaluate the coefficients. Typically, you would only accept variables with a p-value < .05, but I am going to broaden my tolerance levels here a bit. Again, I am not trying to create an accurate prediction, I am trying to better undertand my data. Therefore, I am going to examine anything with a p-value < .15.</p>
+
+
+
+
+
+```{r Generalized linear model}
+
+glm <- glm(isPositive ~., data = subset(review_onehot_train, select = -class))
+
+glm_predict <- predict(glm, review_onehot_test)
+
+glm_table <- data.frame("Predict" = glm_predict, "Actual" = review_onehot_test$class)
+
+plot(glm)
+
+
+predict_cutoff <- predict_test >= default_cutoff * 1.0
+
+table("Predicted" = predict_cutoff,"Actual" = review_onehot_test$isPositive)
+
+hist(predict_test)
+
+summary(glm)
+  
+  
+```
+<p>The diagnostics are screaming that this model is trash and should be thrown away. At a minimum, some serious normalization needs to occur. Given that these data are all dummy variables for text with a somewhat limited volume of data, it would make sense that the data aren't behaving like normally distributed data. As I reached thi point in my analysis, I had to make decision as to whether to proceed. Again, given the risks here are relatively and my recommendations are relatively broad, I am going to go ahead and proceed with my analysis and recommendation. I can already hear the comments section going nuts....</p>
+
+<h2>Conclusion and recommendation</h2>
+<p>While the GLM model would call out the signficantly negative impacts of support email, home kit, and the returns policy, the purpose of this excercise was to identify a "Talk Trigger". If we define a possible candidate as as a statistically signficant phrase or word that creates positive word of mouth, we are given 3 choices. "Love", "Money", and "Easy Setup". It would be hard to create anything meaningful with "Love". "Money" may be a powerful talking point, but since Rachio is a premium priced product, it may not be clear how money plays in for people in a really eye catching way.</p>
+<p>Easy Setup feels like a clear Talk Trigger opportunity to me. So many positive experiences are created out of the ease of installation. When installation is mentioned in negative reviews, it is often in suggesting that installation was difficult or frustrating. Create a guaratneed hassle free installation program could be eye catching, would be an amazing talk trigger. IF you can't get it installed within 30 minutes, we will install it for you. Due to my NDA, I'll have to leave the idea there, but that seems like the start of a really compelling Talk Trigger campaign.</p> 
+```{r Conclusion}
+glm_table <- as.data.frame(coef(summary(glm)))
+glm_table$names <- row.names(glm_table)
+
+glm_tables <- glm_table %>% filter(`Pr(>|t|)` <= .05) %>% filter(names != "(Intercept)") %>% select(names,Estimate,`Pr(>|t|)`) %>% mutate(Estimate = round(Estimate, digits = 3))
+
+glm_tables
+
+ggplot(data = glm_tables, aes(x = names, y = Estimate)) +
+  labs(title = "Terms with < .05 P Value", x = "Reviews containing terms", y="Relative Imact on Customer") +
+  geom_bar(stat = "identity", fill = "skyblue", alpha = .7) + 
+  geom_label(aes(label = Estimate)) +
+  theme(axis.text.x = element_text(angle = -90)) 
+```
